@@ -30,7 +30,7 @@ from starlette.routing import Mount
 from typing_extensions import assert_never
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import ModelConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine  # type: ignore
 from vllm.engine.multiprocessing.client import MQLLMEngineClient
@@ -310,11 +310,9 @@ def mount_metrics(app: FastAPI):
     # We need to set PROMETHEUS_MULTIPROC_DIR environment variable
     # before prometheus_client is imported.
     # See https://prometheus.github.io/client_python/multiprocess/
-    from prometheus_client import (REGISTRY, CollectorRegistry, make_asgi_app,
+    from prometheus_client import (CollectorRegistry, make_asgi_app,
                                    multiprocess)
     from prometheus_fastapi_instrumentator import Instrumentator
-
-    registry = REGISTRY
 
     prometheus_multiproc_dir_path = os.getenv("PROMETHEUS_MULTIPROC_DIR", None)
     if prometheus_multiproc_dir_path is not None:
@@ -322,21 +320,22 @@ def mount_metrics(app: FastAPI):
                      prometheus_multiproc_dir_path)
         registry = CollectorRegistry()
         multiprocess.MultiProcessCollector(registry)
+        Instrumentator(
+            excluded_handlers=[
+                "/metrics",
+                "/health",
+                "/load",
+                "/ping",
+                "/version",
+            ],
+            registry=registry,
+        ).add().instrument(app).expose(app)
 
-    Instrumentator(
-        excluded_handlers=[
-            "/metrics",
-            "/health",
-            "/load",
-            "/ping",
-            "/version",
-            "/server_info",
-        ],
-        registry=registry,
-    ).add().instrument(app).expose(app)
-
-    # Add prometheus asgi middleware to route /metrics requests
-    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+        # Add prometheus asgi middleware to route /metrics requests
+        metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+    else:
+        # Add prometheus asgi middleware to route /metrics requests
+        metrics_route = Mount("/metrics", make_asgi_app())
 
     # Workaround for 307 Redirect for /metrics
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
@@ -462,6 +461,22 @@ async def show_version():
     ver = {"version": VLLM_VERSION}
     return JSONResponse(content=ver)
 
+import math
+def fix_logprobs(logprobs: list[dict]):
+    def clip_logprob(logprob: float):
+        if not isinstance(logprob, float) or math.isnan(logprob):
+            return -1e10
+        if logprob > 1e10:
+            return 1e10
+        if logprob < -1e10:
+            return -1e10
+        
+        return logprob
+
+    for choice in logprobs["choices"]:
+        if "logprobs" in choice:
+            for logprob in choice["logprobs"]["content"]:
+                logprob["logprob"] = clip_logprob(logprob["logprob"])
 
 @router.post("/v1/chat/completions",
              dependencies=[Depends(validate_json_request)])
@@ -476,12 +491,18 @@ async def create_chat_completion(request: ChatCompletionRequest,
 
     generator = await handler.create_chat_completion(request, raw_request)
 
+    content = generator.model_dump()
+    try:
+        fix_logprobs(content)
+    except Exception as e:
+        print("Error fixing logprobs: ", e)
+
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
+        return JSONResponse(content=content,
                             status_code=generator.code)
 
     elif isinstance(generator, ChatCompletionResponse):
-        return JSONResponse(content=generator.model_dump())
+        return JSONResponse(content=content)
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
 
@@ -496,11 +517,18 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             message="The model does not support Completions API")
 
     generator = await handler.create_completion(request, raw_request)
+
+    content = generator.model_dump()
+    try:
+        fix_logprobs(content)
+    except Exception as e:
+        print("Error fixing logprobs: ", e)
+
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
+        return JSONResponse(content=content,
                             status_code=generator.code)
     elif isinstance(generator, CompletionResponse):
-        return JSONResponse(content=generator.model_dump())
+        return JSONResponse(content=content)
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
 
@@ -687,11 +715,6 @@ TASK_HANDLERS: dict[str, dict[str, tuple]] = {
 }
 
 if envs.VLLM_SERVER_DEV_MODE:
-
-    @router.get("/server_info")
-    async def show_server_info(raw_request: Request):
-        server_info = {"vllm_config": str(raw_request.app.state.vllm_config)}
-        return JSONResponse(content=server_info)
 
     @router.post("/reset_prefix_cache")
     async def reset_prefix_cache(raw_request: Request):
@@ -881,8 +904,7 @@ def build_app(args: Namespace) -> FastAPI:
                 section async for section in response.body_iterator
             ]
             response.body_iterator = iterate_in_threadpool(iter(response_body))
-            logger.info("response_body={%s}",
-                        response_body[0].decode() if response_body else None)
+            logger.info("response_body={%s}", response_body[0].decode())
             return response
 
     for middleware in args.middleware:
@@ -901,7 +923,7 @@ def build_app(args: Namespace) -> FastAPI:
 
 async def init_app_state(
     engine_client: EngineClient,
-    vllm_config: VllmConfig,
+    model_config: ModelConfig,
     state: State,
     args: Namespace,
 ) -> None:
@@ -922,8 +944,6 @@ async def init_app_state(
 
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
-    state.vllm_config = vllm_config
-    model_config = vllm_config.model_config
 
     resolved_chat_template = load_chat_template(args.chat_template)
     if resolved_chat_template is not None:
@@ -1078,8 +1098,8 @@ async def run_server(args, **uvicorn_kwargs) -> None:
     async with build_async_engine_client(args) as engine_client:
         app = build_app(args)
 
-        vllm_config = await engine_client.get_vllm_config()
-        await init_app_state(engine_client, vllm_config, app.state, args)
+        model_config = await engine_client.get_model_config()
+        await init_app_state(engine_client, model_config, app.state, args)
 
         def _listen_addr(a: str) -> str:
             if is_valid_ipv6_address(a):
