@@ -916,6 +916,10 @@ class OpenAIServingChat(OpenAIServing):
         choices: list[ChatCompletionResponseChoice] = []
 
         role = self.get_chat_request_role(request)
+        
+        print(final_res.prompt_token_ids)
+        print(final_res.prompt_logprobs)
+
         for output in final_res.outputs:
             token_ids = output.token_ids
             out_logprobs = output.logprobs
@@ -923,8 +927,8 @@ class OpenAIServingChat(OpenAIServing):
             if request.logprobs and request.top_logprobs is not None:
                 assert out_logprobs is not None, "Did not output logprobs"
                 logprobs = self._create_chat_logprobs(
-                    token_ids=token_ids,
-                    top_logprobs=out_logprobs,
+                    token_ids=final_res.prompt_token_ids + token_ids,
+                    top_logprobs=final_res.prompt_logprobs + out_logprobs,
                     num_output_top_logprobs=request.top_logprobs,
                     tokenizer=tokenizer,
                     return_as_token_id=request.return_tokens_as_token_ids,
